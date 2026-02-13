@@ -6,4 +6,5 @@
 // Voorbeeld:
 // window.WE_API_BASE = "https://jouw-backend.onrender.com";
 
-window.WE_API_BASE = window.WE_API_BASE || "";
+window.WE_API_BASE = "https://travelworldv2.onrender.com";
+
