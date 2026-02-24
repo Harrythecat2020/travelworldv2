@@ -1230,26 +1230,48 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
             population: b.population?.value || ""
           }
         };
+      async function run(sparql, mode){
+        try {
+          const data = await wdqsQuery(sparql, { signal, timeoutMs: 10000 });
+          const b = (data?.results?.bindings || [])[0] || {};
+          const uri = b.country?.value || "";
+          const countryQid = qidFromUri(uri);
+          return {
+            countryQid,
+            queryMode: mode,
+            meta: {
+              capital: b.capitalLabel?.value || "—",
+              continent: b.continentLabel?.value || "—",
+              population: b.population?.value || ""
+            }
+          };
+        } catch (err) {
+          const msg = (err && err.message) ? err.message : String(err);
+          throw new Error(`[countryLookup:${mode}] iso=${raw || "-"} name="${safeName || "-"}" ${msg}`);
+        }
       }
 
       // 1) Primair: match op ISO code (P300/P299)
       let sparql = `
-        SELECT ?country ?capitalLabel ?continentLabel ?population WHERE {
+        SELECT ?country ?capitalLabel ?continentLabel ?population ?sitelinks WHERE {
+          ?country wdt:P31/wdt:P279* wd:Q6256 .
           ${countryPropLine}
           OPTIONAL { ?country wdt:P36 ?capital . }
           OPTIONAL { ?country wdt:P30 ?continent . }
           OPTIONAL { ?country wdt:P1082 ?population . }
+          OPTIONAL { ?country wikibase:sitelinks ?sitelinks . }
           SERVICE wikibase:label { bd:serviceParam wikibase:language "nl,en". }
         }
+        ORDER BY DESC(COALESCE(?sitelinks, 0)) DESC(COALESCE(?population, 0)) ?country
         LIMIT 1
       `;
-      let out = await run(sparql);
+      let out = await run(sparql, "iso");
       if (out.countryQid) return out;
 
       // 2) Fallback: match op label (handig als code-mapping ontbreekt/afwijkt)
       if (safeName) {
         const sparql2 = `
-          SELECT ?country ?capitalLabel ?continentLabel ?population WHERE {
+          SELECT ?country ?capitalLabel ?continentLabel ?population ?sitelinks WHERE {
             ?country wdt:P31/wdt:P279* wd:Q6256 .
             ?country rdfs:label ?lbl .
             FILTER(LANG(?lbl) IN ("nl", "en"))
@@ -1257,11 +1279,13 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
             OPTIONAL { ?country wdt:P36 ?capital . }
             OPTIONAL { ?country wdt:P30 ?continent . }
             OPTIONAL { ?country wdt:P1082 ?population . }
+            OPTIONAL { ?country wikibase:sitelinks ?sitelinks . }
             SERVICE wikibase:label { bd:serviceParam wikibase:language "nl,en". }
           }
+          ORDER BY DESC(COALESCE(?sitelinks, 0)) DESC(COALESCE(?population, 0)) ?country
           LIMIT 1
         `;
-        out = await run(sparql2);
+        out = await run(sparql2, "label-fallback");
       }
 
       return out;
@@ -1859,6 +1883,8 @@ async function loadPlacesProgressive({ countryQid, iso3 }, signal, token) {
           e.code = "invalid_country_mapping";
           throw e;
         }
+        const { countryQid, meta, queryMode } = await getCountryByIsoWithMeta(iso3, name, mySignal);
+        if (!countryQid) throw new Error(`[countryLookup:${queryMode || "none"}] iso=${iso3} name="${name}" Geen Wikidata land gevonden.`);
         if (myToken !== activeLoadToken) return;
 
         cache.byIso.set(iso3, { countryQid, meta, places: [], ts: Date.now() });
