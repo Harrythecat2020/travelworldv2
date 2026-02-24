@@ -1170,6 +1170,7 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
       if (code === "temporary_outage" || code === "upstream_unreachable") return "Wikidata is tijdelijk niet beschikbaar. Probeer zo opnieuw.";
       if (code === "invalid_query") return "De zoekvraag naar Wikidata is ongeldig. Probeer een ander land.";
       if (code === "timeout") return "Timeout bij Wikidata. Probeer opnieuw.";
+      if (code === "forbidden" || code === "upstream_error") return "Wikidata gaf geen bruikbaar antwoord. Probeer het zo opnieuw.";
       if (code === "invalid_country_mapping") return "Geen geldige landkoppeling gevonden voor dit land.";
       return err?.message || "Wikidata gaf een onbekende fout.";
     }
@@ -1215,8 +1216,8 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
 
       const isNum = isIsoNumeric(raw);
       const countryPropLine = isNum
-        ? `?country wdt:P299 ?_c . FILTER(STR(?_c) = "${safeCode}") .`
-        : `?country wdt:P298 ?_c . FILTER(UCASE(STR(?_c)) = "${safeCode.toUpperCase()}") .`;
+        ? `?country wdt:P299 ?_c . FILTER(STR(?_c) = "${safeCode}")`
+        : `?country wdt:P298 ?_c . FILTER(UCASE(STR(?_c)) = "${safeCode.toUpperCase()}")`;
 
       async function run(sparql, mode){
         try {
