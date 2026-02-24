@@ -649,18 +649,7 @@
     const EARTH_IMG = "https://unpkg.com/three-globe/example/img/earth-night.jpg";
     const BUMP_IMG  = "https://unpkg.com/three-globe/example/img/earth-topology.png";
     const SKY_IMG   = "https://unpkg.com/three-globe/example/img/night-sky.png";
-    const WIKIDATA_API = "/api/wikidata";
-
-    // Heuristiek: plekken die vaak nuttig zijn voor “explore”
-    const PRIMARY_PLACE_TYPES = [
-      "Q9259",   // UNESCO World Heritage Site
-      "Q46169",  // national park
-      "Q570116", // tourist attraction
-      "Q473972", // museum
-      "Q8502",   // mountain
-      "Q34038",  // waterfall
-      "Q40080"   // beach
-    ];
+    const COUNTRY_PLACES_API = "/api/countries";
 
     // ====== UI refs ======
     const el = (id) => document.getElementById(id);
@@ -1091,28 +1080,6 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
       setStatus("ok", okText);
     }
 
-    function parseWktPoint(wkt) {
-      if (!wkt) return null;
-      const m = /Point\(([-\d.]+)\s+([-\d.]+)\)/.exec(wkt);
-      if (!m) return null;
-      const lon = Number(m[1]);
-      const lat = Number(m[2]);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-      return { lat, lon };
-    }
-
-    function qidFromUri(uri) {
-      if (!uri) return "";
-      const m = /\/(Q\d+)$/.exec(uri);
-      return m ? m[1] : "";
-    }
-
-    function commonsImageUrl(fileUriOrName, width=520) {
-      if (!fileUriOrName) return "";
-      const u = String(fileUriOrName);
-      if (u.includes("Special:FilePath/")) return u + `?width=${encodeURIComponent(width)}`;
-      return `https://commons.wikimedia.org/wiki/Special:FilePath/${encodeURIComponent(u)}?width=${encodeURIComponent(width)}`;
-    }
 
     function googleMapsLink(lat, lon) {
       const q = `${lat},${lon}`;
@@ -1163,30 +1130,26 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
       }
     }
 
-    // ====== WDQS ======
+    // ====== Country + places API ======
     function toUserFacingWdqsError(err) {
       const code = err?.code || "";
       if (code === "rate_limited") return "Wikidata is nu druk (rate-limit). Probeer het over een paar seconden opnieuw.";
       if (code === "temporary_outage" || code === "upstream_unreachable") return "Wikidata is tijdelijk niet beschikbaar. Probeer zo opnieuw.";
-      if (code === "invalid_query") return "De zoekvraag naar Wikidata is ongeldig. Probeer een ander land.";
-      if (code === "timeout") return "Timeout bij Wikidata. Probeer opnieuw.";
-      if (code === "forbidden" || code === "upstream_error") return "Wikidata gaf geen bruikbaar antwoord. Probeer het zo opnieuw.";
       if (code === "invalid_country_mapping") return "Geen geldige landkoppeling gevonden voor dit land.";
+      if (code === "timeout") return "Timeout bij Wikidata. Probeer opnieuw.";
       return err?.message || "Wikidata gaf een onbekende fout.";
     }
 
-    async function wdqsQuery(sparql, { signal, timeoutMs = 28000 } = {}) {
+    async function apiGetJson(url, { signal, timeoutMs = 28000 } = {}) {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);
       const abortHandler = () => ctrl.abort();
       if (signal) signal.addEventListener("abort", abortHandler, { once: true });
 
       try {
-        const url = `${WIKIDATA_API}?query=${encodeURIComponent(sparql)}`;
-        const res = await fetch(url, { method: "GET", signal: ctrl.signal });
+        const res = await fetch(url, { method: "GET", signal: ctrl.signal, credentials: "include" });
         const payload = await res.json().catch(() => null);
-
-        if (res.ok && payload?.ok) return payload.data;
+        if (res.ok && payload?.ok) return payload;
 
         const err = new Error(toUserFacingWdqsError(payload?.error || {}));
         err.code = payload?.error?.code || "upstream_error";
@@ -1206,196 +1169,42 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
       }
     }
 
-    async function getCountryByIsoWithMeta(code, name, signal) {
-      // world-atlas geeft ISO-numeric (3 digits).
-      // Wikidata: P299 = ISO 3166-1 numeric, P298 = ISO 3166-1 alpha-3.
-      // Belangrijk: deze properties kunnen in WDQS getypeerde literals opleveren; daarom matchen we op STR().
-      const raw = String(code ?? "").trim();
-      const safeCode = raw.replace(/"/g, "\\\"");
-      const safeName = String(name ?? "").trim().replace(/"/g, "\\\"");
-
-      const isNum = isIsoNumeric(raw);
-      const countryPropLine = isNum
-        ? `?country wdt:P299 ?_c . FILTER(STR(?_c) = "${safeCode}")`
-        : `?country wdt:P298 ?_c . FILTER(UCASE(STR(?_c)) = "${safeCode.toUpperCase()}")`;
-
-      async function run(sparql, mode){
-        try {
-          const data = await wdqsQuery(sparql, { signal, timeoutMs: 10000 });
-          const b = (data?.results?.bindings || [])[0] || {};
-          const uri = b.country?.value || "";
-          const countryQid = qidFromUri(uri);
-          return {
-            countryQid,
-            queryMode: mode,
-            meta: {
-              capital: b.capitalLabel?.value || "—",
-              continent: b.continentLabel?.value || "—",
-              population: b.population?.value || ""
-            }
-          };
-        } catch (err) {
-          const msg = (err && err.message) ? err.message : String(err);
-          throw new Error(`[countryLookup:${mode}] iso=${raw || "-"} name="${safeName || "-"}" ${msg}`);
-        }
-      }
-
-      // 1) Primair: match op ISO code (P300/P299)
-      let sparql = `
-        SELECT ?country ?capitalLabel ?continentLabel ?population ?sitelinks WHERE {
-          ?country wdt:P31/wdt:P279* wd:Q6256 .
-          ${countryPropLine}
-          OPTIONAL { ?country wdt:P36 ?capital . }
-          OPTIONAL { ?country wdt:P30 ?continent . }
-          OPTIONAL { ?country wdt:P1082 ?population . }
-          OPTIONAL { ?country wikibase:sitelinks ?sitelinks . }
-          SERVICE wikibase:label { bd:serviceParam wikibase:language "nl,en". }
-        }
-        ORDER BY DESC(COALESCE(?sitelinks, 0)) DESC(COALESCE(?population, 0)) ?country
-        LIMIT 1
-      `;
-      let out = await run(sparql, "iso");
-      if (out.countryQid) return out;
-
-      // 2) Fallback: match op label (handig als code-mapping ontbreekt/afwijkt)
-      if (safeName) {
-        const sparql2 = `
-          SELECT ?country ?capitalLabel ?continentLabel ?population ?sitelinks WHERE {
-            ?country wdt:P31/wdt:P279* wd:Q6256 .
-            ?country rdfs:label ?lbl .
-            FILTER(LANG(?lbl) IN ("nl", "en"))
-            FILTER(STR(?lbl) = "${safeName}")
-            OPTIONAL { ?country wdt:P36 ?capital . }
-            OPTIONAL { ?country wdt:P30 ?continent . }
-            OPTIONAL { ?country wdt:P1082 ?population . }
-            OPTIONAL { ?country wikibase:sitelinks ?sitelinks . }
-            SERVICE wikibase:label { bd:serviceParam wikibase:language "nl,en". }
-          }
-          ORDER BY DESC(COALESCE(?sitelinks, 0)) DESC(COALESCE(?population, 0)) ?country
-          LIMIT 1
-        `;
-        out = await run(sparql2, "label-fallback");
-      }
-
-      return out;
+    async function fetchCountryWithPlaces(iso3, countryName, signal) {
+      const url = `${COUNTRY_PLACES_API}/${encodeURIComponent(iso3)}${countryName ? `?countryName=${encodeURIComponent(countryName)}&limit=40` : '?limit=40'}`;
+      const payload = await apiGetJson(url, { signal, timeoutMs: 26000 });
+      return payload;
     }
 
-    async function queryPlaces(countryQid, {
-      types = [],
-      limit = 30,
-      minSitelinks = 0,
-      includeP131 = false
-    } = {}, signal, timeoutMs = 26000) {
-      const typeBlock = (types && types.length)
-        ? `VALUES ?t { ${types.map(q => `wd:${q}`).join(" ")} } ?place wdt:P31/wdt:P279* ?t .`
-        : "";
-
-      const sitelinkFilter = minSitelinks > 0
-        ? `FILTER(COALESCE(?sitelinks, 0) >= ${Number(minSitelinks)})`
-        : "";
-
-      const locationBlock = includeP131
-        ? `{ ?place wdt:P17 ?country . } UNION { ?place wdt:P131* ?country . }`
-        : `?place wdt:P17 ?country .`;
-
-      const sparql = `
-        SELECT ?place ?placeLabel ?placeDescription ?coord ?image ?sitelinks WHERE {
-          BIND(wd:${countryQid} AS ?country)
-          ?place wdt:P625 ?coord .
-          ${locationBlock}
-          ${typeBlock}
-
-          FILTER NOT EXISTS { ?place wdt:P31 wd:Q4167836 }
-          FILTER NOT EXISTS { ?place wdt:P31 wd:Q13406463 }
-
-          OPTIONAL { ?place wdt:P18 ?image . }
-          OPTIONAL { ?place wikibase:sitelinks ?sitelinks . }
-
-          ${sitelinkFilter}
-          SERVICE wikibase:label { bd:serviceParam wikibase:language "nl,en". }
+    async function getCountryByIsoWithMeta(code, name, signal) {
+      const payload = await fetchCountryWithPlaces(code, name, signal);
+      return {
+        countryQid: payload?.country?.qid || "",
+        queryMode: "api",
+        places: Array.isArray(payload?.places) ? payload.places : [],
+        meta: {
+          capital: payload?.country?.capital || "—",
+          continent: payload?.country?.continent || "—",
+          population: payload?.country?.population || ""
         }
-        ORDER BY DESC(COALESCE(?sitelinks, 0))
-        LIMIT ${Number(limit)}
-      `;
-
-      const data = await wdqsQuery(sparql, { signal, timeoutMs });
-      const rows = data?.results?.bindings || [];
-
-      const seen = new Set();
-      const places = [];
-
-      for (const r of rows) {
-        const placeUri = r.place?.value || "";
-        const qid = qidFromUri(placeUri);
-        if (!qid || seen.has(qid)) continue;
-
-        const p = parseWktPoint(r.coord?.value);
-        if (!p) continue;
-
-        seen.add(qid);
-        places.push({
-          qid,
-          label: r.placeLabel?.value || qid,
-          desc: r.placeDescription?.value || "",
-          lat: p.lat,
-          lng: p.lon,
-          image: r.image?.value ? commonsImageUrl(r.image.value, 560) : "",
-          sitelinks: r.sitelinks?.value ? Number(r.sitelinks.value) : 0,
-          wikidataUrl: placeUri
-        });
-      }
-
-      return places;
+      };
     }
 
     async function queryPlaceDetails(placeQid, signal){
-      // Fix #3: plek -> meer info (non-blocking)
-      const sparql = `
-        SELECT
-          ?placeLabel
-          ?placeDescription
-          (GROUP_CONCAT(DISTINCT ?typeLabel; separator=", ") AS ?types)
-          (SAMPLE(?website) AS ?website)
-          (SAMPLE(?inception) AS ?inception)
-          (SAMPLE(?population) AS ?population)
-          (SAMPLE(?area) AS ?area)
-          (SAMPLE(?countryLabel) AS ?countryLabel)
-          (SAMPLE(?adminLabel) AS ?adminLabel)
-          (SAMPLE(?image) AS ?image)
-        WHERE {
-          BIND(wd:${placeQid} AS ?place)
-          OPTIONAL { ?place wdt:P31 ?type . }
-          OPTIONAL { ?place wdt:P856 ?website . }
-          OPTIONAL { ?place wdt:P571 ?inception . }
-          OPTIONAL { ?place wdt:P1082 ?population . }
-          OPTIONAL { ?place wdt:P2046 ?area . }
-          OPTIONAL { ?place wdt:P17 ?country . }
-          OPTIONAL { ?place wdt:P131 ?admin . }
-          OPTIONAL { ?place wdt:P18 ?image . }
-          SERVICE wikibase:label { bd:serviceParam wikibase:language "nl,en". }
-        }
-        GROUP BY ?placeLabel ?placeDescription
-        LIMIT 1
-      `;
-      const data = await wdqsQuery(sparql, { signal, timeoutMs: 26000 });
-      const b = (data?.results?.bindings || [])[0] || {};
-
-      const img = b.image?.value ? commonsImageUrl(b.image.value, 760) : "";
-
-      return {
+      const payload = await apiGetJson(`/api/places/${encodeURIComponent(placeQid)}`, { signal, timeoutMs: 22000 });
+      return payload?.details || {
         ts: Date.now(),
-        types: b.types?.value || "",
-        website: b.website?.value || "",
-        inception: b.inception?.value || "",
-        population: b.population?.value || "",
-        area: b.area?.value || "",
-        country: b.countryLabel?.value || "",
-        admin: b.adminLabel?.value || "",
-        image: img
+        types: "",
+        website: "",
+        inception: "",
+        population: "",
+        area: "",
+        country: "",
+        admin: "",
+        image: ""
       };
     }
-async function loadPlacesProgressive({ countryQid, iso3 }, signal, token) {
-  // Toon direct een seed (centroid) bij klik
+
+async function loadPlacesProgressive({ countryQid, iso3, prefetchedPlaces }, signal, token) {
   const seed = instantSeedsByIso.get(iso3);
   if (seed) {
     renderPlaces([seed]);
@@ -1406,51 +1215,22 @@ async function loadPlacesProgressive({ countryQid, iso3 }, signal, token) {
   try {
     showLoading("Plekken ophalen via Wikidata…");
 
-    // 1) Eerst de belangrijkste type-plekken (UNESCO, NP, etc.)
-    let primary = await queryPlaces(countryQid, {
-      types: PRIMARY_PLACE_TYPES,
-      limit: 34,
-      minSitelinks: 5,
-      includeP131: true
-    }, signal, 15000);
-
-    if (token !== activeLoadToken) return;
-
-    // 2) Als het te leeg is, vul aan met generieke plekken met coördinaten
-    let fallback = [];
-    if (primary.length < 14) {
-      fallback = await queryPlaces(countryQid, {
-        types: [],
-        limit: 34,
-        minSitelinks: 2,
-        // fallback query moet snel en stabiel zijn
-        includeP131: false
-      }, signal, 15000);
+    let places = Array.isArray(prefetchedPlaces) ? prefetchedPlaces.slice(0, 40) : [];
+    if (!places.length && countryQid) {
+      const payload = await fetchCountryWithPlaces(iso3, panelTitle.textContent, signal);
+      places = (payload?.places || []).slice(0, 40);
     }
 
     if (token !== activeLoadToken) return;
-
-    // merge + uniq op qid
-    const seen = new Set();
-    const merged = [];
-    for (const p of [...primary, ...fallback]) {
-      const qid = String(p?.qid || "");
-      if (!qid || seen.has(qid)) continue;
-      seen.add(qid);
-      merged.push(p);
-    }
-
-    const places = merged.slice(0, 40);
 
     renderPlaces(places);
     plotPins(places);
 
-    // Sla op in cache
     const existing = cache.byIso.get(iso3) || {};
     cache.byIso.set(iso3, { ...existing, places, ts: Date.now() });
     saveLocalCache();
 
-    hideLoading(`${places.length} plekken geladen via Wikidata.`);
+    hideLoading(`${places.length} plekken geladen via de nieuwe landen-API.`);
     panelSubtitle.textContent = "Open de galerij of klik een plek voor details.";
   } catch (e) {
     if (e && (e.name === "AbortError" || String(e).includes("aborted"))) return;
@@ -1866,7 +1646,7 @@ async function loadPlacesProgressive({ countryQid, iso3 }, signal, token) {
 
         // haal land QID + meta op
         showLoading("Landinfo ophalen…");
-        const { countryQid, meta, queryMode } = await getCountryByIsoWithMeta(iso3, name, mySignal);
+        const { countryQid, meta, queryMode, places: prefetchedPlaces } = await getCountryByIsoWithMeta(iso3, name, mySignal);
         if (!countryQid) {
           const e = new Error(`[countryLookup:${queryMode || "none"}] iso=${iso3} name="${name}" Geen Wikidata land gevonden.`);
           e.code = "invalid_country_mapping";
@@ -1879,7 +1659,7 @@ async function loadPlacesProgressive({ countryQid, iso3 }, signal, token) {
         renderMeta(iso3, countryQid, meta);
 
         showLoading("Plekken ophalen…");
-        await loadPlacesProgressive({ countryQid, iso3 }, mySignal, myToken);
+        await loadPlacesProgressive({ countryQid, iso3, prefetchedPlaces }, mySignal, myToken);
         closePanelIfMobile();
       } catch (err) {
         if (err && (err.name === "AbortError" || String(err).includes("aborted"))) return;
