@@ -29,7 +29,7 @@ function normalizeSparqlQuery(input){
 }
 
 function isCountryMetadataQuery(sparql){
-  return /wdt:P(299|300)\b/i.test(sparql) || (/wdt:P36\b/i.test(sparql) && /wdt:P30\b/i.test(sparql));
+  return /wdt:P(298|299|300)\b/i.test(sparql) || (/wdt:P36\b/i.test(sparql) && /wdt:P30\b/i.test(sparql));
 }
 
 function isFrequentPlaceQuery(sparql){

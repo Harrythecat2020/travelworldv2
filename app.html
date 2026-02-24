@@ -1206,16 +1206,17 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
     }
 
     async function getCountryByIsoWithMeta(code, name, signal) {
-      // world-atlas geeft ISO-numeric (3 digits). Wikidata: P300 = ISO numeric, P299 = alpha-3.
-      // Belangrijk: P300 kan in WDQS getypeerde literals opleveren; daarom matchen we op STR().
+      // world-atlas geeft ISO-numeric (3 digits).
+      // Wikidata: P299 = ISO 3166-1 numeric, P298 = ISO 3166-1 alpha-3.
+      // Belangrijk: deze properties kunnen in WDQS getypeerde literals opleveren; daarom matchen we op STR().
       const raw = String(code ?? "").trim();
       const safeCode = raw.replace(/"/g, "\\\"");
       const safeName = String(name ?? "").trim().replace(/"/g, "\\\"");
 
       const isNum = isIsoNumeric(raw);
       const countryPropLine = isNum
-        ? `?country wdt:P300 ?_c . FILTER(STR(?_c) = "${safeCode}") .`
-        : `?country wdt:P299 ?_c . FILTER(UCASE(STR(?_c)) = "${safeCode.toUpperCase()}") .`;
+        ? `?country wdt:P299 ?_c . FILTER(STR(?_c) = "${safeCode}") .`
+        : `?country wdt:P298 ?_c . FILTER(UCASE(STR(?_c)) = "${safeCode.toUpperCase()}") .`;
 
       async function run(sparql, mode){
         try {
