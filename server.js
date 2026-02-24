@@ -60,6 +60,7 @@ function setCachedWdqsResult(cacheKey, payload){
 
 function classifyWdqsError(status){
   if (status === 400) return { code: 'invalid_query', message: 'SPARQL-query is ongeldig.', httpStatus: 400, retryable: false };
+  if (status === 403) return { code: 'forbidden', message: 'Wikidata weigert deze query tijdelijk.', httpStatus: 502, retryable: true };
   if (status === 429) return { code: 'rate_limited', message: 'Wikidata rate-limit bereikt.', httpStatus: 429, retryable: true };
   if (status === 408 || status === 504) return { code: 'timeout', message: 'Timeout bij Wikidata.', httpStatus: 504, retryable: true };
   if ([500, 502, 503].includes(status)) return { code: 'temporary_outage', message: 'Wikidata tijdelijk niet beschikbaar.', httpStatus: 503, retryable: true };
