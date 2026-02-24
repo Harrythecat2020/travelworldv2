@@ -646,9 +646,18 @@
   <script>
     // ====== Config ======
     const WORLD_ATLAS_TOPOJSON = "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json";
-    const EARTH_IMG = "https://unpkg.com/three-globe/example/img/earth-night.jpg";
-    const BUMP_IMG  = "https://unpkg.com/three-globe/example/img/earth-topology.png";
-    const SKY_IMG   = "https://unpkg.com/three-globe/example/img/night-sky.png";
+    const EARTH_IMG_CANDIDATES = [
+      "https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-night.jpg",
+      "https://unpkg.com/three-globe/example/img/earth-night.jpg"
+    ];
+    const BUMP_IMG_CANDIDATES = [
+      "https://cdn.jsdelivr.net/npm/three-globe/example/img/earth-topology.png",
+      "https://unpkg.com/three-globe/example/img/earth-topology.png"
+    ];
+    const SKY_IMG_CANDIDATES = [
+      "https://cdn.jsdelivr.net/npm/three-globe/example/img/night-sky.png",
+      "https://unpkg.com/three-globe/example/img/night-sky.png"
+    ];
     const COUNTRY_PLACES_API = "/api/countries";
 
     // ====== UI refs ======
@@ -918,6 +927,38 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
 
     function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
     function isShiftActive(evt){ return !!(shiftHeld || evt?.shiftKey); }
+
+    function loadImage(url, timeoutMs = 4500) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        const timeout = setTimeout(() => {
+          img.src = "";
+          reject(new Error(`Timeout loading image: ${url}`));
+        }, timeoutMs);
+
+        img.onload = () => {
+          clearTimeout(timeout);
+          resolve(url);
+        };
+        img.onerror = () => {
+          clearTimeout(timeout);
+          reject(new Error(`Failed loading image: ${url}`));
+        };
+        img.src = url;
+      });
+    }
+
+    async function pickFirstReachableImage(candidates) {
+      for (const candidate of candidates) {
+        try {
+          await loadImage(candidate);
+          return candidate;
+        } catch (_) {
+          // probeer volgende mirror
+        }
+      }
+      return "";
+    }
 
     function applyShiftSpeeds(){
       const controls = globe?.controls?.();
@@ -1674,10 +1715,14 @@ async function loadPlacesProgressive({ countryQid, iso3, prefetchedPlaces }, sig
     async function init() {
       await refreshAuth({ silent: true });
       if (!authState.authed) openAuthGate();
+
+      const [earthImg, bumpImg, skyImg] = await Promise.all([
+        pickFirstReachableImage(EARTH_IMG_CANDIDATES),
+        pickFirstReachableImage(BUMP_IMG_CANDIDATES),
+        pickFirstReachableImage(SKY_IMG_CANDIDATES)
+      ]);
+
       globe = Globe()(el("globeViz"))
-        .globeImageUrl(EARTH_IMG)
-        .bumpImageUrl(BUMP_IMG)
-        .backgroundImageUrl(SKY_IMG)
         .atmosphereColor("rgba(122,168,255,0.35)")
         .atmosphereAltitude(0.22)
         .showGraticules(false)
@@ -1689,6 +1734,16 @@ async function loadPlacesProgressive({ countryQid, iso3, prefetchedPlaces }, sig
             .polygonCapColor(x => x === selectedCountry ? "rgba(122,168,255,0.62)" : (x === hoveredCountry ? "rgba(255,255,255,0.18)" : "rgba(255,255,255,0.07)"))
             .polygonStrokeColor(x => x === selectedCountry ? "rgba(255,255,255,0.70)" : (x === hoveredCountry ? "rgba(255,255,255,0.45)" : "rgba(255,255,255,0.22)"));
         });
+
+      if (earthImg) globe.globeImageUrl(earthImg);
+      if (bumpImg) globe.bumpImageUrl(bumpImg);
+      if (skyImg) globe.backgroundImageUrl(skyImg);
+
+      if (!earthImg) {
+        const mat = globe.globeMaterial?.();
+        if (mat?.color?.setStyle) mat.color.setStyle("#21417d");
+        if (mat?.emissive?.setStyle) mat.emissive.setStyle("#0d1a32");
+      }
 
       globe.pointOfView({ lat: 18, lng: 10, altitude: 2.35 }, 0);
 
