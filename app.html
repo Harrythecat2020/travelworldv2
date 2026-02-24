@@ -649,7 +649,7 @@
     const EARTH_IMG = "https://unpkg.com/three-globe/example/img/earth-night.jpg";
     const BUMP_IMG  = "https://unpkg.com/three-globe/example/img/earth-topology.png";
     const SKY_IMG   = "https://unpkg.com/three-globe/example/img/night-sky.png";
-    const WDQS = "https://query.wikidata.org/sparql";
+    const WIKIDATA_API = "/api/wikidata";
 
     // Heuristiek: plekken die vaak nuttig zijn voor “explore”
     const PRIMARY_PLACE_TYPES = [
@@ -1164,47 +1164,45 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
     }
 
     // ====== WDQS ======
-    async function wdqsQuery(sparql, { signal, timeoutMs = 12000 } = {}) {
-      const maxTries = 2;
-      for (let attempt = 0; attempt < maxTries; attempt++) {
-        const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    function toUserFacingWdqsError(err) {
+      const code = err?.code || "";
+      if (code === "rate_limited") return "Wikidata is nu druk (rate-limit). Probeer het over een paar seconden opnieuw.";
+      if (code === "temporary_outage" || code === "upstream_unreachable") return "Wikidata is tijdelijk niet beschikbaar. Probeer zo opnieuw.";
+      if (code === "invalid_query") return "De zoekvraag naar Wikidata is ongeldig. Probeer een ander land.";
+      if (code === "timeout") return "Timeout bij Wikidata. Probeer opnieuw.";
+      if (code === "invalid_country_mapping") return "Geen geldige landkoppeling gevonden voor dit land.";
+      return err?.message || "Wikidata gaf een onbekende fout.";
+    }
 
-        const abortHandler = () => ctrl.abort();
-        if (signal) signal.addEventListener("abort", abortHandler, { once: true });
+    async function wdqsQuery(sparql, { signal, timeoutMs = 28000 } = {}) {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeoutMs);
+      const abortHandler = () => ctrl.abort();
+      if (signal) signal.addEventListener("abort", abortHandler, { once: true });
 
-        try {
-          const url = `${WDQS}?format=json&query=${encodeURIComponent(sparql)}`;
-          const res = await fetch(url, {
-            method: "GET",
-            headers: {
-              "Accept": "application/sparql-results+json"
-            },
-            signal: ctrl.signal
-          });
+      try {
+        const url = `${WIKIDATA_API}?query=${encodeURIComponent(sparql)}`;
+        const res = await fetch(url, { method: "GET", signal: ctrl.signal });
+        const payload = await res.json().catch(() => null);
 
-          if (res.ok) return await res.json();
+        if (res.ok && payload?.ok) return payload.data;
 
-          const retryable = [429, 500, 502, 503, 504].includes(res.status);
-          const text = await res.text().catch(() => "");
-          if (retryable && attempt < maxTries - 1) {
-            await new Promise(r => setTimeout(r, 450 * (attempt + 1)));
-            continue;
-          }
-          throw new Error(`WDQS fout: ${res.status} ${res.statusText} ${text.slice(0, 160)}`);
-        } catch (e) {
-          if (e && (e.name === "AbortError" || String(e).includes("aborted"))) {
-            if (signal?.aborted) throw e;
-            if (attempt < maxTries - 1) continue;
-            throw new Error("Timeout bij Wikidata. Probeer opnieuw.");
-          }
-          throw e;
-        } finally {
-          clearTimeout(t);
-          if (signal) signal.removeEventListener("abort", abortHandler);
+        const err = new Error(toUserFacingWdqsError(payload?.error || {}));
+        err.code = payload?.error?.code || "upstream_error";
+        err.details = payload?.error || {};
+        throw err;
+      } catch (e) {
+        if (e && (e.name === "AbortError" || String(e).includes("aborted"))) {
+          if (signal?.aborted) throw e;
+          const timeoutErr = new Error("Timeout bij Wikidata. Probeer opnieuw.");
+          timeoutErr.code = "timeout";
+          throw timeoutErr;
         }
+        throw e;
+      } finally {
+        clearTimeout(t);
+        if (signal) signal.removeEventListener("abort", abortHandler);
       }
-      throw new Error("WDQS fout: onbekend");
     }
 
     async function getCountryByIsoWithMeta(code, name, signal) {
@@ -1220,7 +1218,7 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
         : `?country wdt:P299 ?_c . FILTER(UCASE(STR(?_c)) = "${safeCode.toUpperCase()}") .`;
 
       async function run(sparql){
-        const data = await wdqsQuery(sparql, { signal, timeoutMs: 10000 });
+        const data = await wdqsQuery(sparql, { signal, timeoutMs: 26000 });
         const b = (data?.results?.bindings || [])[0] || {};
         const uri = b.country?.value || "";
         const countryQid = qidFromUri(uri);
@@ -1274,7 +1272,7 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
       limit = 30,
       minSitelinks = 0,
       includeP131 = false
-    } = {}, signal, timeoutMs = 12000) {
+    } = {}, signal, timeoutMs = 26000) {
       const typeBlock = (types && types.length)
         ? `VALUES ?t { ${types.map(q => `wd:${q}`).join(" ")} } ?place wdt:P31/wdt:P279* ?t .`
         : "";
@@ -1366,7 +1364,7 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
         GROUP BY ?placeLabel ?placeDescription
         LIMIT 1
       `;
-      const data = await wdqsQuery(sparql, { signal, timeoutMs: 9000 });
+      const data = await wdqsQuery(sparql, { signal, timeoutMs: 26000 });
       const b = (data?.results?.bindings || [])[0] || {};
 
       const img = b.image?.value ? commonsImageUrl(b.image.value, 760) : "";
@@ -1856,7 +1854,11 @@ async function loadPlacesProgressive({ countryQid, iso3 }, signal, token) {
         // haal land QID + meta op
         showLoading("Landinfo ophalen…");
         const { countryQid, meta } = await getCountryByIsoWithMeta(iso3, name, mySignal);
-        if (!countryQid) throw new Error(`Geen Wikidata land gevonden voor code ${iso3}.`);
+        if (!countryQid) {
+          const e = new Error("Geen Wikidata land gevonden voor code.");
+          e.code = "invalid_country_mapping";
+          throw e;
+        }
         if (myToken !== activeLoadToken) return;
 
         cache.byIso.set(iso3, { countryQid, meta, places: [], ts: Date.now() });
@@ -2271,5 +2273,4 @@ async function loadPlacesProgressive({ countryQid, iso3 }, signal, token) {
   </script>
 </body>
 </html>
-
 

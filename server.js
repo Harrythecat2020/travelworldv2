@@ -14,10 +14,69 @@ const { open } = require('sqlite');
 
 const PORT = process.env.PORT || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
+const WDQS_ENDPOINT = 'https://query.wikidata.org/sparql';
 
 const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'data', 'app.db');
 const SESSION_COOKIE = 'we_session';
 const SESSION_DAYS = Number(process.env.SESSION_DAYS || 7);
+const WDQS_CACHE_TTL_MS = Number(process.env.WDQS_CACHE_TTL_MS || 10 * 60 * 1000);
+const WDQS_MAX_CACHE_ENTRIES = Number(process.env.WDQS_MAX_CACHE_ENTRIES || 150);
+
+const wdqsCache = new Map();
+
+function normalizeSparqlQuery(input){
+  return String(input || '').replace(/\s+/g, ' ').trim();
+}
+
+function isCountryMetadataQuery(sparql){
+  return /wdt:P(299|300)\b/i.test(sparql) || (/wdt:P36\b/i.test(sparql) && /wdt:P30\b/i.test(sparql));
+}
+
+function isFrequentPlaceQuery(sparql){
+  return /\?place\s+wdt:P625/i.test(sparql) && /wdt:P17\b|wdt:P131\*/i.test(sparql);
+}
+
+function shouldCacheSparql(sparql){
+  return isCountryMetadataQuery(sparql) || isFrequentPlaceQuery(sparql);
+}
+
+function getCachedWdqsResult(cacheKey){
+  const cached = wdqsCache.get(cacheKey);
+  if (!cached) return null;
+  if (cached.expiresAt < Date.now()) {
+    wdqsCache.delete(cacheKey);
+    return null;
+  }
+  return cached.payload;
+}
+
+function setCachedWdqsResult(cacheKey, payload){
+  wdqsCache.set(cacheKey, { payload, expiresAt: Date.now() + WDQS_CACHE_TTL_MS });
+  while (wdqsCache.size > WDQS_MAX_CACHE_ENTRIES) {
+    const first = wdqsCache.keys().next().value;
+    wdqsCache.delete(first);
+  }
+}
+
+function classifyWdqsError(status){
+  if (status === 400) return { code: 'invalid_query', message: 'SPARQL-query is ongeldig.', httpStatus: 400, retryable: false };
+  if (status === 429) return { code: 'rate_limited', message: 'Wikidata rate-limit bereikt.', httpStatus: 429, retryable: true };
+  if (status === 408 || status === 504) return { code: 'timeout', message: 'Timeout bij Wikidata.', httpStatus: 504, retryable: true };
+  if ([500, 502, 503].includes(status)) return { code: 'temporary_outage', message: 'Wikidata tijdelijk niet beschikbaar.', httpStatus: 503, retryable: true };
+  return { code: 'upstream_error', message: 'Onverwachte fout van Wikidata.', httpStatus: 502, retryable: false };
+}
+
+function sendApiError(res, info, details){
+  return res.status(info.httpStatus).json({
+    ok: false,
+    error: {
+      code: info.code,
+      message: info.message,
+      retryable: info.retryable,
+      ...details
+    }
+  });
+}
 
 // Comma-separated list of allowed frontend origins (scheme + host + optional port)
 // Example: FRONTEND_ORIGINS="https://username.github.io,http://localhost:3000"
@@ -237,6 +296,102 @@ async function main(){
 
     const token = await createSession(res, user.id);
     res.json({ ok: true, email: user.email, token });
+  });
+
+  app.get('/api/wikidata', async (req, res) => {
+    const rawQuery = req.query?.query;
+    const sparql = normalizeSparqlQuery(rawQuery);
+    if (!sparql) {
+      return sendApiError(res, {
+        code: 'invalid_query',
+        message: 'SPARQL-query ontbreekt.',
+        httpStatus: 400,
+        retryable: false
+      });
+    }
+
+    const cacheKey = normalizeSparqlQuery(sparql).toLowerCase();
+    if (shouldCacheSparql(sparql)) {
+      const cached = getCachedWdqsResult(cacheKey);
+      if (cached) return res.json({ ok: true, cached: true, data: cached });
+    }
+
+    const maxAttempts = 4;
+    const timeoutMs = 7500;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const upstreamUrl = `${WDQS_ENDPOINT}?format=json&query=${encodeURIComponent(sparql)}`;
+        const upstreamRes = await fetch(upstreamUrl, {
+          method: 'GET',
+          headers: {
+            Accept: 'application/sparql-results+json',
+            'User-Agent': 'WereldExplorer/1.0 (contact: support@wereldexplorer.local)'
+          },
+          signal: controller.signal
+        });
+
+        if (upstreamRes.ok) {
+          const data = await upstreamRes.json();
+          if (shouldCacheSparql(sparql)) setCachedWdqsResult(cacheKey, data);
+          return res.json({ ok: true, cached: false, data });
+        }
+
+        const info = classifyWdqsError(upstreamRes.status);
+        const retryAllowed = info.retryable && attempt < maxAttempts - 1;
+        const bodyText = await upstreamRes.text().catch(() => '');
+
+        if (retryAllowed) {
+          const backoffMs = 400 * (2 ** attempt);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+          continue;
+        }
+
+        return sendApiError(res, info, {
+          status: upstreamRes.status,
+          upstreamMessage: bodyText.slice(0, 240)
+        });
+      } catch (err) {
+        const aborted = err?.name === 'AbortError';
+        const isFinalAttempt = attempt >= maxAttempts - 1;
+
+        if (!isFinalAttempt) {
+          const backoffMs = 400 * (2 ** attempt);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+          continue;
+        }
+
+        if (aborted) {
+          return sendApiError(res, {
+            code: 'timeout',
+            message: 'Timeout bij Wikidata.',
+            httpStatus: 504,
+            retryable: true
+          });
+        }
+
+        return sendApiError(res, {
+          code: 'upstream_unreachable',
+          message: 'Kan Wikidata tijdelijk niet bereiken.',
+          httpStatus: 502,
+          retryable: true
+        }, {
+          detail: String(err?.message || err)
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    return sendApiError(res, {
+      code: 'temporary_outage',
+      message: 'Wikidata tijdelijk niet beschikbaar.',
+      httpStatus: 503,
+      retryable: true
+    });
   });
 
   // ===== Static =====
