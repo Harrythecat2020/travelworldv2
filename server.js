@@ -19,8 +19,8 @@ const WDQS_ENDPOINT = 'https://query.wikidata.org/sparql';
 const DB_FILE = process.env.DB_FILE || path.join(__dirname, 'data', 'app.db');
 const SESSION_COOKIE = 'we_session';
 const SESSION_DAYS = Number(process.env.SESSION_DAYS || 7);
-const WDQS_CACHE_TTL_MS = Number(process.env.WDQS_CACHE_TTL_MS || 10 * 60 * 1000);
-const WDQS_MAX_CACHE_ENTRIES = Number(process.env.WDQS_MAX_CACHE_ENTRIES || 150);
+const WDQS_CACHE_TTL_MS = Number(process.env.WDQS_CACHE_TTL_MS || 15 * 60 * 1000);
+const WDQS_MAX_CACHE_ENTRIES = Number(process.env.WDQS_MAX_CACHE_ENTRIES || 250);
 
 const wdqsCache = new Map();
 
@@ -28,16 +28,8 @@ function normalizeSparqlQuery(input){
   return String(input || '').replace(/\s+/g, ' ').trim();
 }
 
-function isCountryMetadataQuery(sparql){
-  return /wdt:P(298|299|300)\b/i.test(sparql) || (/wdt:P36\b/i.test(sparql) && /wdt:P30\b/i.test(sparql));
-}
-
-function isFrequentPlaceQuery(sparql){
-  return /\?place\s+wdt:P625/i.test(sparql) && /wdt:P17\b|wdt:P131\*/i.test(sparql);
-}
-
-function shouldCacheSparql(sparql){
-  return isCountryMetadataQuery(sparql) || isFrequentPlaceQuery(sparql);
+function normalizeCacheKey(input){
+  return normalizeSparqlQuery(input).toLowerCase();
 }
 
 function getCachedWdqsResult(cacheKey){
@@ -56,6 +48,95 @@ function setCachedWdqsResult(cacheKey, payload){
     const first = wdqsCache.keys().next().value;
     wdqsCache.delete(first);
   }
+}
+
+function qidFromUri(uri){
+  const m = String(uri || '').match(/Q\d+$/i);
+  return m ? m[0].toUpperCase() : '';
+}
+
+function parsePointLiteral(value){
+  const m = String(value || '').match(/Point\(([-+\d.]+)\s+([-+\d.]+)\)/);
+  if (!m) return null;
+  const lng = Number(m[1]);
+  const lat = Number(m[2]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return { lat, lng };
+}
+
+function commonsImageUrl(fileName, width = 640){
+  const name = String(fileName || '').replace(/^File:/i, '').trim();
+  if (!name) return '';
+  const encoded = encodeURIComponent(name.replace(/ /g, '_'));
+  return `https://commons.wikimedia.org/wiki/Special:FilePath/${encoded}?width=${width}`;
+}
+
+async function fetchWdqsJson(sparql, { timeoutMs = 9000, maxAttempts = 4 } = {}){
+  const normalized = normalizeSparqlQuery(sparql);
+  const cacheKey = normalizeCacheKey(normalized);
+  const cached = getCachedWdqsResult(cacheKey);
+  if (cached) return { cached: true, data: cached };
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const upstreamUrl = `${WDQS_ENDPOINT}?format=json&query=${encodeURIComponent(normalized)}`;
+      const upstreamRes = await fetch(upstreamUrl, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/sparql-results+json',
+          'User-Agent': 'WereldExplorer/2.0 (tourism-country-places)'
+        },
+        signal: controller.signal
+      });
+
+      if (upstreamRes.ok) {
+        const data = await upstreamRes.json();
+        setCachedWdqsResult(cacheKey, data);
+        return { cached: false, data };
+      }
+
+      const info = classifyWdqsError(upstreamRes.status);
+      const retryAllowed = info.retryable && attempt < maxAttempts - 1;
+      const bodyText = await upstreamRes.text().catch(() => '');
+      if (retryAllowed) {
+        await new Promise(resolve => setTimeout(resolve, 400 * (2 ** attempt)));
+        continue;
+      }
+
+      const err = new Error(info.message);
+      err.info = info;
+      err.details = { status: upstreamRes.status, upstreamMessage: bodyText.slice(0, 240) };
+      throw err;
+    } catch (err) {
+      const aborted = err?.name === 'AbortError';
+      const isFinalAttempt = attempt >= maxAttempts - 1;
+      if (!isFinalAttempt && !err?.info) {
+        await new Promise(resolve => setTimeout(resolve, 400 * (2 ** attempt)));
+        continue;
+      }
+
+      if (aborted) {
+        const timeoutErr = new Error('Timeout bij Wikidata.');
+        timeoutErr.info = { code: 'timeout', message: 'Timeout bij Wikidata.', httpStatus: 504, retryable: true };
+        throw timeoutErr;
+      }
+      if (err?.info) throw err;
+
+      const networkErr = new Error('Kan Wikidata tijdelijk niet bereiken.');
+      networkErr.info = { code: 'upstream_unreachable', message: 'Kan Wikidata tijdelijk niet bereiken.', httpStatus: 502, retryable: true };
+      networkErr.details = { detail: String(err?.message || err) };
+      throw networkErr;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  const e = new Error('Wikidata tijdelijk niet beschikbaar.');
+  e.info = { code: 'temporary_outage', message: 'Wikidata tijdelijk niet beschikbaar.', httpStatus: 503, retryable: true };
+  throw e;
 }
 
 function classifyWdqsError(status){
@@ -299,100 +380,147 @@ async function main(){
     res.json({ ok: true, email: user.email, token });
   });
 
-  app.get('/api/wikidata', async (req, res) => {
-    const rawQuery = req.query?.query;
-    const sparql = normalizeSparqlQuery(rawQuery);
-    if (!sparql) {
-      return sendApiError(res, {
-        code: 'invalid_query',
-        message: 'SPARQL-query ontbreekt.',
-        httpStatus: 400,
-        retryable: false
-      });
+  app.get('/api/countries/:isoCode/places', async (req, res) => {
+    const isoCode = String(req.params.isoCode || '').trim();
+    const countryName = String(req.query?.countryName || '').trim();
+    const limit = Math.max(5, Math.min(80, Number(req.query?.limit) || 40));
+
+    const isNumeric = /^\d{3}$/.test(isoCode);
+    const isAlpha3 = /^[A-Za-z]{3}$/.test(isoCode);
+    if (!isNumeric && !isAlpha3) {
+      return sendApiError(res, { code: 'invalid_country_mapping', message: 'Ongeldige landcode.', httpStatus: 400, retryable: false });
     }
 
-    const cacheKey = normalizeSparqlQuery(sparql).toLowerCase();
-    if (shouldCacheSparql(sparql)) {
-      const cached = getCachedWdqsResult(cacheKey);
-      if (cached) return res.json({ ok: true, cached: true, data: cached });
-    }
+    const isoClause = isNumeric
+      ? `?country wdt:P299 ?isoNumeric . FILTER(STR(?isoNumeric) = "${isoCode}")`
+      : `?country wdt:P298 ?isoAlpha3 . FILTER(UCASE(STR(?isoAlpha3)) = "${isoCode.toUpperCase()}")`;
 
-    const maxAttempts = 4;
-    const timeoutMs = 7500;
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-      try {
-        const upstreamUrl = `${WDQS_ENDPOINT}?format=json&query=${encodeURIComponent(sparql)}`;
-        const upstreamRes = await fetch(upstreamUrl, {
-          method: 'GET',
-          headers: {
-            Accept: 'application/sparql-results+json',
-            'User-Agent': 'WereldExplorer/1.0 (contact: support@wereldexplorer.local)'
-          },
-          signal: controller.signal
-        });
-
-        if (upstreamRes.ok) {
-          const data = await upstreamRes.json();
-          if (shouldCacheSparql(sparql)) setCachedWdqsResult(cacheKey, data);
-          return res.json({ ok: true, cached: false, data });
-        }
-
-        const info = classifyWdqsError(upstreamRes.status);
-        const retryAllowed = info.retryable && attempt < maxAttempts - 1;
-        const bodyText = await upstreamRes.text().catch(() => '');
-
-        if (retryAllowed) {
-          const backoffMs = 400 * (2 ** attempt);
-          await new Promise(resolve => setTimeout(resolve, backoffMs));
-          continue;
-        }
-
-        return sendApiError(res, info, {
-          status: upstreamRes.status,
-          upstreamMessage: bodyText.slice(0, 240)
-        });
-      } catch (err) {
-        const aborted = err?.name === 'AbortError';
-        const isFinalAttempt = attempt >= maxAttempts - 1;
-
-        if (!isFinalAttempt) {
-          const backoffMs = 400 * (2 ** attempt);
-          await new Promise(resolve => setTimeout(resolve, backoffMs));
-          continue;
-        }
-
-        if (aborted) {
-          return sendApiError(res, {
-            code: 'timeout',
-            message: 'Timeout bij Wikidata.',
-            httpStatus: 504,
-            retryable: true
-          });
-        }
-
-        return sendApiError(res, {
-          code: 'upstream_unreachable',
-          message: 'Kan Wikidata tijdelijk niet bereiken.',
-          httpStatus: 502,
-          retryable: true
-        }, {
-          detail: String(err?.message || err)
-        });
-      } finally {
-        clearTimeout(timeout);
+    const lookupSparql = `
+      SELECT ?country ?countryLabel ?capitalLabel ?continentLabel ?population ?isoAlpha3 ?isoNumeric WHERE {
+        ?country wdt:P31/wdt:P279* wd:Q6256 .
+        ${isoClause}
+        OPTIONAL { ?country wdt:P298 ?isoAlpha3 . }
+        OPTIONAL { ?country wdt:P299 ?isoNumeric . }
+        OPTIONAL { ?country wdt:P36 ?capital . }
+        OPTIONAL { ?country wdt:P30 ?continent . }
+        OPTIONAL { ?country wdt:P1082 ?population . }
+        SERVICE wikibase:label { bd:serviceParam wikibase:language "nl,en". }
       }
+      LIMIT 1
+    `;
+
+    try {
+      const lookupData = (await fetchWdqsJson(lookupSparql, { timeoutMs: 9000 })).data;
+      const countryBinding = (lookupData?.results?.bindings || [])[0] || null;
+      if (!countryBinding?.country?.value) {
+        return sendApiError(res, { code: 'invalid_country_mapping', message: 'Geen land gevonden voor deze code.', httpStatus: 404, retryable: false });
+      }
+
+      const countryQid = qidFromUri(countryBinding.country.value);
+      const placesSparql = `
+        SELECT ?place ?placeLabel ?placeDescription ?coord ?image ?kindLabel ?sitelinks WHERE {
+          BIND(wd:${countryQid} AS ?country)
+          {
+            ?place wdt:P17 ?country .
+          } UNION {
+            ?place wdt:P131* ?country .
+          }
+          ?place wdt:P625 ?coord .
+          OPTIONAL { ?place wdt:P18 ?image . }
+          OPTIONAL { ?place wdt:P31 ?kind . }
+          OPTIONAL { ?place wikibase:sitelinks ?sitelinks . }
+          SERVICE wikibase:label { bd:serviceParam wikibase:language "nl,en". }
+          FILTER (!BOUND(?sitelinks) || ?sitelinks >= 2)
+        }
+        ORDER BY DESC(COALESCE(?sitelinks, 0))
+        LIMIT ${limit}
+      `;
+
+      const placesData = (await fetchWdqsJson(placesSparql, { timeoutMs: 16000 })).data;
+      const places = [];
+      for (const row of placesData?.results?.bindings || []) {
+        const qid = qidFromUri(row.place?.value);
+        const point = parsePointLiteral(row.coord?.value);
+        if (!qid || !point) continue;
+        places.push({
+          qid,
+          label: row.placeLabel?.value || qid,
+          desc: row.placeDescription?.value || '',
+          type: row.kindLabel?.value || '',
+          lat: point.lat,
+          lng: point.lng,
+          image: row.image?.value ? commonsImageUrl(row.image.value, 640) : '',
+          sitelinks: row.sitelinks?.value ? Number(row.sitelinks.value) : 0,
+          wikidataUrl: row.place?.value || ''
+        });
+      }
+
+      return res.json({
+        ok: true,
+        country: {
+          qid: countryQid,
+          name: countryBinding.countryLabel?.value || countryName || countryQid,
+          isoAlpha3: countryBinding.isoAlpha3?.value || (isAlpha3 ? isoCode.toUpperCase() : ''),
+          isoNumeric: countryBinding.isoNumeric?.value || (isNumeric ? isoCode : ''),
+          capital: countryBinding.capitalLabel?.value || '—',
+          continent: countryBinding.continentLabel?.value || '—',
+          population: countryBinding.population?.value || '',
+          wikidataUrl: `https://www.wikidata.org/wiki/${countryQid}`
+        },
+        places
+      });
+    } catch (err) {
+      return sendApiError(res, err.info || { code: 'upstream_error', message: 'Onverwachte fout van Wikidata.', httpStatus: 502, retryable: false }, err.details || {});
+    }
+  });
+
+  app.get('/api/places/:placeQid', async (req, res) => {
+    const placeQid = String(req.params.placeQid || '').toUpperCase();
+    if (!/^Q\d+$/.test(placeQid)) {
+      return sendApiError(res, { code: 'invalid_place_id', message: 'Ongeldige plaats-id.', httpStatus: 400, retryable: false });
     }
 
-    return sendApiError(res, {
-      code: 'temporary_outage',
-      message: 'Wikidata tijdelijk niet beschikbaar.',
-      httpStatus: 503,
-      retryable: true
-    });
+    const sparql = `
+      SELECT ?placeLabel ?placeDescription (GROUP_CONCAT(DISTINCT ?typeLabel; separator=", ") AS ?types)
+             (SAMPLE(?website) AS ?website) (SAMPLE(?inception) AS ?inception)
+             (SAMPLE(?population) AS ?population) (SAMPLE(?area) AS ?area)
+             (SAMPLE(?countryLabel) AS ?countryLabel) (SAMPLE(?adminLabel) AS ?adminLabel) (SAMPLE(?image) AS ?image)
+      WHERE {
+        BIND(wd:${placeQid} AS ?place)
+        OPTIONAL { ?place wdt:P31 ?type . }
+        OPTIONAL { ?place wdt:P856 ?website . }
+        OPTIONAL { ?place wdt:P571 ?inception . }
+        OPTIONAL { ?place wdt:P1082 ?population . }
+        OPTIONAL { ?place wdt:P2046 ?area . }
+        OPTIONAL { ?place wdt:P17 ?country . }
+        OPTIONAL { ?place wdt:P131 ?admin . }
+        OPTIONAL { ?place wdt:P18 ?image . }
+        SERVICE wikibase:label { bd:serviceParam wikibase:language "nl,en". }
+      }
+      GROUP BY ?placeLabel ?placeDescription
+      LIMIT 1
+    `;
+
+    try {
+      const data = (await fetchWdqsJson(sparql, { timeoutMs: 12000 })).data;
+      const b = (data?.results?.bindings || [])[0] || {};
+      return res.json({
+        ok: true,
+        details: {
+          ts: Date.now(),
+          types: b.types?.value || '',
+          website: b.website?.value || '',
+          inception: b.inception?.value || '',
+          population: b.population?.value || '',
+          area: b.area?.value || '',
+          country: b.countryLabel?.value || '',
+          admin: b.adminLabel?.value || '',
+          image: b.image?.value ? commonsImageUrl(b.image.value, 760) : ''
+        }
+      });
+    } catch (err) {
+      return sendApiError(res, err.info || { code: 'upstream_error', message: 'Onverwachte fout van Wikidata.', httpStatus: 502, retryable: false }, err.details || {});
+    }
   });
 
   // ===== Static =====
