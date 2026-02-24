@@ -1217,19 +1217,6 @@ if (authGate) authGate.addEventListener("click", (e) => { if (e.target === authG
         ? `?country wdt:P300 ?_c . FILTER(STR(?_c) = "${safeCode}") .`
         : `?country wdt:P299 ?_c . FILTER(UCASE(STR(?_c)) = "${safeCode.toUpperCase()}") .`;
 
-      async function run(sparql){
-        const data = await wdqsQuery(sparql, { signal, timeoutMs: 26000 });
-        const b = (data?.results?.bindings || [])[0] || {};
-        const uri = b.country?.value || "";
-        const countryQid = qidFromUri(uri);
-        return {
-          countryQid,
-          meta: {
-            capital: b.capitalLabel?.value || "—",
-            continent: b.continentLabel?.value || "—",
-            population: b.population?.value || ""
-          }
-        };
       async function run(sparql, mode){
         try {
           const data = await wdqsQuery(sparql, { signal, timeoutMs: 10000 });
@@ -1877,14 +1864,12 @@ async function loadPlacesProgressive({ countryQid, iso3 }, signal, token) {
 
         // haal land QID + meta op
         showLoading("Landinfo ophalen…");
-        const { countryQid, meta } = await getCountryByIsoWithMeta(iso3, name, mySignal);
+        const { countryQid, meta, queryMode } = await getCountryByIsoWithMeta(iso3, name, mySignal);
         if (!countryQid) {
-          const e = new Error("Geen Wikidata land gevonden voor code.");
+          const e = new Error(`[countryLookup:${queryMode || "none"}] iso=${iso3} name="${name}" Geen Wikidata land gevonden.`);
           e.code = "invalid_country_mapping";
           throw e;
         }
-        const { countryQid, meta, queryMode } = await getCountryByIsoWithMeta(iso3, name, mySignal);
-        if (!countryQid) throw new Error(`[countryLookup:${queryMode || "none"}] iso=${iso3} name="${name}" Geen Wikidata land gevonden.`);
         if (myToken !== activeLoadToken) return;
 
         cache.byIso.set(iso3, { countryQid, meta, places: [], ts: Date.now() });
@@ -2299,4 +2284,3 @@ async function loadPlacesProgressive({ countryQid, iso3 }, signal, token) {
   </script>
 </body>
 </html>
-
