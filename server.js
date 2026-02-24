@@ -55,6 +55,38 @@ function qidFromUri(uri){
   return m ? m[0].toUpperCase() : '';
 }
 
+function normalizeCountryName(input = ''){
+  return String(input || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function pickBestCountryBinding(bindings, countryName = ''){
+  const normalizedNeedle = normalizeCountryName(countryName);
+  const scored = (Array.isArray(bindings) ? bindings : []).map((row) => {
+    const label = row?.countryLabel?.value || '';
+    const aliases = (row?.aliases?.value || '').split('|').filter(Boolean);
+    const allNames = [label, ...aliases].map(normalizeCountryName).filter(Boolean);
+    const hasExactName = normalizedNeedle ? allNames.includes(normalizedNeedle) : false;
+    const hasCloseName = normalizedNeedle
+      ? allNames.some((n) => n.startsWith(normalizedNeedle) || normalizedNeedle.startsWith(n))
+      : false;
+    const isSovereignState = row?.isSovereignState?.value === 'true';
+    const hasPopulation = Boolean(row?.population?.value);
+    const score = (hasExactName ? 100 : 0)
+      + (hasCloseName ? 25 : 0)
+      + (isSovereignState ? 12 : 0)
+      + (hasPopulation ? 3 : 0);
+    return { row, score };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0]?.row || null;
+}
+
 function parsePointLiteral(value){
   const m = String(value || '').match(/Point\(([-+\d.]+)\s+([-+\d.]+)\)/);
   if (!m) return null;
@@ -396,7 +428,10 @@ async function main(){
       : `?country wdt:P298 ?isoAlpha3 . FILTER(UCASE(STR(?isoAlpha3)) = "${isoCode.toUpperCase()}")`;
 
     const lookupSparql = `
-      SELECT ?country ?countryLabel ?capitalLabel ?continentLabel ?population ?isoAlpha3 ?isoNumeric WHERE {
+      SELECT ?country ?countryLabel ?capitalLabel ?continentLabel ?population ?isoAlpha3 ?isoNumeric
+             (GROUP_CONCAT(DISTINCT ?alias; separator="|") AS ?aliases)
+             (SAMPLE(IF(?instance = wd:Q3624078, true, false)) AS ?isSovereignState)
+      WHERE {
         ?country wdt:P31/wdt:P279* wd:Q6256 .
         ${isoClause}
         OPTIONAL { ?country wdt:P298 ?isoAlpha3 . }
@@ -404,14 +439,18 @@ async function main(){
         OPTIONAL { ?country wdt:P36 ?capital . }
         OPTIONAL { ?country wdt:P30 ?continent . }
         OPTIONAL { ?country wdt:P1082 ?population . }
+        OPTIONAL { ?country skos:altLabel ?alias . FILTER(LANG(?alias) IN ("nl", "en")) }
+        OPTIONAL { ?country wdt:P31 ?instance . }
         SERVICE wikibase:label { bd:serviceParam wikibase:language "nl,en". }
       }
-      LIMIT 1
+      GROUP BY ?country ?countryLabel ?capitalLabel ?continentLabel ?population ?isoAlpha3 ?isoNumeric
+      LIMIT 15
     `;
 
     try {
       const lookupData = (await fetchWdqsJson(lookupSparql, { timeoutMs: 9000 })).data;
-      const countryBinding = (lookupData?.results?.bindings || [])[0] || null;
+      const candidates = lookupData?.results?.bindings || [];
+      const countryBinding = pickBestCountryBinding(candidates, countryName);
       if (!countryBinding?.country?.value) {
         return sendApiError(res, { code: 'invalid_country_mapping', message: 'Geen land gevonden voor deze code.', httpStatus: 404, retryable: false });
       }
